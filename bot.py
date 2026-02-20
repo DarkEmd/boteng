@@ -14,11 +14,10 @@ import requests
 import PyPDF2
 import speech_recognition as sr
 from pydub import AudioSegment
-import json
 
 # Настройка логирования
 logging.basicConfig(
-    format='%(astime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MISTRAL_API_KEY = os.environ.get('MISTRAL_API_KEY')
-MISTRAL_MODEL = 'mistral-small'
+MISTRAL_MODEL = 'mistral-small'  # можно заменить на 'mistral-medium' или 'mistral-large'
 
 # Режимы перевода
 class TranslationMode:
@@ -42,92 +41,74 @@ user_data = defaultdict(lambda: {
     'review_mode': False,
     'review_indices': [],
     'review_index': 0,
-    'mode': None,  # будет установлен после загрузки
+    'mode': None,
     'source_lang': None,
     'target_lang': None,
-    'failed_words': []  # слова, которые не удалось перевести
+    'failed_words': []
 })
 
-# Кэш для переводов (чтобы не дёргать API повторно)
+# Кэш для переводов и проверки синонимов
 translation_cache = {}
+
+# ----------------------------------------------------------------------
+# Функции очистки и обработки текста
+# ----------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
     """
-    Очистка текста от лишних символов, номеров страниц, артефактов PDF.
+    Удаляет мусор из извлечённого текста (номера страниц, лишние символы).
     """
     if not text:
         return ""
-    
     # Удаляем номера страниц (часто встречаются в PDF)
     text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
-    
-    # Удаляем странные символы, оставляем буквы, цифры, пробелы и базовые знаки препинания
-    text = re.sub(r'[^\w\s\-.,!?;:]', ' ', text)
-    
+    # Удаляем странные символы, оставляя буквы, цифры, пробелы и полезные знаки
+    text = re.sub(r'[^\w\s\-.,!?;:|•/—]', ' ', text)
     # Убираем множественные пробелы
     text = re.sub(r'\s+', ' ', text)
-    
-    # Разбиваем на отдельные слова, если текст слипся (может быть при распознавании PDF)
-    # Но не разбиваем слишком агрессивно
-    
     return text.strip()
+
+def clean_translation(text: str) -> str:
+    """
+    Очищает перевод от лишних знаков препинания в конце (например, "Совет !!!!!!!!" -> "Совет").
+    """
+    text = re.sub(r'[!?.]+$', '', text.strip())
+    text = ' '.join(text.split())
+    return text
 
 def split_into_words(text: str) -> List[str]:
     """
     Интеллектуальное разбиение текста на отдельные слова/фразы.
-    Пытается определить, где одно слово, а где несколько.
+    Поддерживает разделители: новая строка, точка с запятой, запятая, •, |, /, —, -
     """
-    # Сначала очищаем текст
     text = clean_text(text)
-    
-    # Если текст пустой
     if not text:
         return []
     
-    # Пробуем разбить по строкам, точкам с запятой, запятым (если это список)
-    # Но сохраняем фразы из нескольких слов как единое целое
-    lines = []
+    # Приоритетные разделители
+    delimiters = ['\n', ';', ',', '•', '|', '/', '—', '-']
     
-    # Сначала пробуем разбить по переводу строки
-    if '\n' in text:
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-    else:
-        # Если нет перевода строки, пробуем разбить по точке с запятой или запятой
-        if ';' in text:
-            lines = [part.strip() for part in text.split(';') if part.strip()]
-        elif ',' in text:
-            lines = [part.strip() for part in text.split(',') if part.strip()]
-        else:
-            # Если ничего не помогло, считаем всё одной фразой
-            lines = [text]
-    
-    # Дополнительная обработка: если строка слишком длинная (> 50 символов),
-    # возможно, это несколько слов без разделителей
-    final_words = []
-    for line in lines:
-        if len(line) > 50 and ' ' not in line:
-            # Слипшийся текст - пробуем разбить по заглавным буквам
-            # Например: "AppleBananaCherry" -> ["Apple", "Banana", "Cherry"]
-            parts = re.findall(r'[A-Z][a-z]*|[a-z]+', line)
+    for delim in delimiters:
+        if delim in text:
+            parts = [part.strip() for part in text.split(delim) if part.strip()]
             if len(parts) > 1:
-                final_words.extend(parts)
-            else:
-                final_words.append(line)
-        else:
-            final_words.append(line)
+                return parts
     
-    return final_words
+    # Если нет явных разделителей, но строка длинная и без пробелов – пробуем разбить по заглавным буквам
+    if len(text) > 50 and ' ' not in text:
+        parts = re.findall(r'[A-Z][a-z]*|[a-z]+', text)
+        if len(parts) > 1:
+            return parts
+    
+    return [text]
 
 def extract_words_from_pdf(file_path: str) -> List[str]:
     """
-    Улучшенное извлечение слов из PDF с очисткой от артефактов.
+    Извлекает слова из PDF, очищает и разбивает.
     """
-    words = []
     try:
         with open(file_path, 'rb') as f:
             reader = PyPDF2.PdfReader(f)
-            
-            # Собираем весь текст со всех страниц
             full_text = ""
             for page in reader.pages:
                 text = page.extract_text()
@@ -135,71 +116,56 @@ def extract_words_from_pdf(file_path: str) -> List[str]:
                     full_text += text + "\n"
             
             if not full_text.strip():
-                # Если текст не извлёкся, возможно это сканированный PDF
-                return []
+                return []  # вероятно, сканированный PDF без текстового слоя
             
-            # Разбиваем на слова с помощью улучшенного парсера
-            words = split_into_words(full_text)
-            
+            return split_into_words(full_text)
     except Exception as e:
         logger.error(f"Ошибка чтения PDF: {e}")
         raise
-    
-    return words
 
 def extract_words_from_txt(file_path: str) -> List[str]:
     """
-    Извлечение слов из текстового файла с очисткой.
+    Извлекает слова из текстового файла.
     """
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
-    
     return split_into_words(content)
 
 def detect_language(word: str) -> str:
     """
-    Определение языка с учётом смешанных случаев.
+    Определяет язык слова по соотношению кириллицы и латиницы.
     """
     if not word:
         return 'unknown'
-    
-    # Считаем количество кириллических символов
-    cyrillic_count = len(re.findall('[а-яА-Я]', word))
-    latin_count = len(re.findall('[a-zA-Z]', word))
-    
-    if cyrillic_count > latin_count:
+    cyrillic = len(re.findall('[а-яА-Я]', word))
+    latin = len(re.findall('[a-zA-Z]', word))
+    if cyrillic > latin:
         return 'russian'
-    elif latin_count > cyrillic_count:
+    elif latin > cyrillic:
         return 'english'
     else:
         # Если поровну или оба нули, смотрим на первый символ
         if word and word[0].isalpha():
-            if re.match('[а-яА-Я]', word[0]):
-                return 'russian'
-            else:
-                return 'english'
+            return 'russian' if re.match('[а-яА-Я]', word[0]) else 'english'
     return 'unknown'
 
 def normalize_answer(text: str) -> str:
     """
-    Нормализация ответа для сравнения.
-    Удаляет все лишние символы, приводит к нижнему регистру.
+    Приводит ответ к стандартному виду для сравнения.
     """
-    # Удаляем всё, кроме букв, цифр и пробелов
     text = re.sub(r'[^\w\s]', '', text.lower())
-    # Убираем лишние пробелы
     text = ' '.join(text.split())
     return text
 
 def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> bool:
     """
-    Проверка, являются ли ответы синонимичными с помощью Mistral API.
+    Проверяет, являются ли ответ и правильный перевод синонимами (через Mistral).
+    При ошибке API использует расстояние Левенштейна как fallback.
     """
-    # Сначала пробуем прямое сравнение
+    # Быстрая проверка
     if normalize_answer(answer) == normalize_answer(correct):
         return True
     
-    # Если простое сравнение не прошло, спрашиваем у Mistral
     cache_key = f"similar_{answer}_{correct}"
     if cache_key in translation_cache:
         return translation_cache[cache_key]
@@ -210,9 +176,9 @@ def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> b
             'Content-Type': 'application/json'
         }
         prompt = (f"Are these two phrases translations of each other or synonyms? "
-                 f"Answer only 'yes' or 'no'.\n"
-                 f"Phrase 1: '{answer}'\n"
-                 f"Phrase 2: '{correct}'")
+                  f"Answer only 'yes' or 'no'.\n"
+                  f"Phrase 1: '{answer}'\n"
+                  f"Phrase 2: '{correct}'")
         
         data = {
             'model': MISTRAL_MODEL,
@@ -220,7 +186,7 @@ def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> b
         }
         
         response = requests.post('https://api.mistral.ai/v1/chat/completions',
-                                headers=headers, json=data, timeout=5)
+                                 headers=headers, json=data, timeout=5)
         response.raise_for_status()
         result = response.json()
         ai_answer = result['choices'][0]['message']['content'].strip().lower()
@@ -231,15 +197,15 @@ def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> b
         
     except Exception as e:
         logger.error(f"Ошибка проверки синонимов: {e}")
-        # Если API недоступен, используем расстояние Левенштейна как fallback
-        similarity = difflib.SequenceMatcher(None, 
-                                           normalize_answer(answer), 
+        # Fallback: сравнение по Левенштейну
+        similarity = difflib.SequenceMatcher(None,
+                                           normalize_answer(answer),
                                            normalize_answer(correct)).ratio()
         return similarity > threshold
 
 def translate_word(word: str, source_lang: str, target_lang: str) -> Optional[str]:
     """
-    Получение перевода через Mistral API с кэшированием.
+    Получает перевод через Mistral API. Результат очищается и кэшируется.
     """
     cache_key = f"{source_lang}_{target_lang}_{word}"
     if cache_key in translation_cache:
@@ -261,42 +227,32 @@ def translate_word(word: str, source_lang: str, target_lang: str) -> Optional[st
     
     try:
         response = requests.post('https://api.mistral.ai/v1/chat/completions',
-                                headers=headers, json=data, timeout=10)
+                                 headers=headers, json=data, timeout=10)
         response.raise_for_status()
         result = response.json()
         translation = result['choices'][0]['message']['content'].strip()
-        
-        # Кэшируем результат
+        translation = clean_translation(translation)  # Очищаем от лишних символов
         translation_cache[cache_key] = translation
         return translation
-        
     except Exception as e:
         logger.error(f"Ошибка перевода слова '{word}': {e}")
         return None
 
+# ----------------------------------------------------------------------
+# Обработчики команд и сообщений
+# ----------------------------------------------------------------------
+
 async def show_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Показывает клавиатуру для выбора режима перевода.
-    """
+    """Показывает инлайн-клавиатуру для выбора режима."""
     keyboard = [
-        [
-            InlineKeyboardButton("🇬🇧 Английский → Русский 🇷🇺", callback_data="mode_en_ru"),
-        ],
-        [
-            InlineKeyboardButton("🇷🇺 Русский → Английский 🇬🇧", callback_data="mode_ru_en"),
-        ]
+        [InlineKeyboardButton("🇬🇧 Английский → Русский 🇷🇺", callback_data="mode_en_ru")],
+        [InlineKeyboardButton("🇷🇺 Русский → Английский 🇬🇧", callback_data="mode_ru_en")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Выберите режим перевода:",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("Выберите режим перевода:", reply_markup=reply_markup)
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработка выбора режима.
-    """
+    """Обрабатывает нажатие на кнопку выбора режима."""
     query = update.callback_query
     await query.answer()
     
@@ -317,9 +273,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text("Теперь отправьте файл со словами.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Команда /start.
-    """
+    """Команда /start."""
     welcome_text = (
         "👋 Привет! Я бот для изучения слов.\n\n"
         "📌 **Как пользоваться:**\n"
@@ -327,20 +281,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Отправьте файл .txt или .pdf со словами\n"
         "3. Отвечайте текстом или голосом\n"
         "4. Я запомню ошибки и предложу повторить\n\n"
-        "✅ **Улучшения:**\n"
+        "✅ **Возможности:**\n"
         "• Распознаю синонимы\n"
         "• Игнорирую лишние символы\n"
-        "• Обрабатываю PDF с картинками\n"
-        "• Запоминаю непереведённые слова"
+        "• Разбиваю строки с разделителями (•, |, / и др.)\n"
+        "• Поддерживаю голосовой ввод"
     )
-    
     await update.message.reply_text(welcome_text)
     await show_mode_selection(update, context)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработка загруженного файла.
-    """
+    """Обрабатывает загруженный файл (TXT или PDF)."""
     user_id = update.effective_user.id
     document = update.message.document
     
@@ -351,7 +302,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     file_name = document.file_name or ""
     if not (file_name.endswith('.txt') or file_name.endswith('.pdf')):
-        await update.message.reply_text("Пожалуйста, отправь файл с расширением .txt или .pdf")
+        await update.message.reply_text("Пожалуйста, отправьте файл с расширением .txt или .pdf")
         return
     
     # Скачиваем файл
@@ -366,14 +317,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines = extract_words_from_txt(tmp_path)
         else:  # PDF
             lines = extract_words_from_pdf(tmp_path)
-            
+        
         if not lines:
             await update.message.reply_text(
                 "Не удалось извлечь слова из файла. Возможно, это сканированный PDF без текстового слоя.\n"
                 "Попробуйте другой файл или текстовый формат."
             )
             return
-            
     except Exception as e:
         logger.error(f"Ошибка обработки файла: {e}")
         await update.message.reply_text("Ошибка при чтении файла. Проверьте его содержимое.")
@@ -381,10 +331,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         os.unlink(tmp_path)
     
-    # Определяем язык первого слова для проверки
+    # Проверка соответствия языка выбранному режиму
     first_word_lang = detect_language(lines[0])
     expected_source = user_data[user_id]['source_lang']
-    
     if first_word_lang != expected_source and first_word_lang != 'unknown':
         await update.message.reply_text(
             f"⚠️ Внимание! Язык первого слова ({first_word_lang}) "
@@ -399,13 +348,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     failed = []
     
     for i, word in enumerate(lines):
-        # Показываем прогресс каждые 10 слов
         if i > 0 and i % 10 == 0:
             await update.message.reply_text(f"⏳ Прогресс: {i}/{len(lines)} слов...")
         
-        trans = translate_word(word, 
-                             user_data[user_id]['source_lang'],
-                             user_data[user_id]['target_lang'])
+        trans = translate_word(word,
+                               user_data[user_id]['source_lang'],
+                               user_data[user_id]['target_lang'])
         if trans:
             translations.append(trans)
         else:
@@ -427,12 +375,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Отчёт
     msg = f"✅ Загружено: {len(lines)} слов\n"
     msg += f"✅ Переведено: {len(translations) - len(failed)}\n"
-    
     if failed:
         msg += f"❌ Не удалось перевести: {len(failed)} слов\n"
         msg += f"📋 Первые 5: {', '.join(failed[:5])}"
     
-    if translations and translations[0]:  # если первое слово перевелось
+    if translations and translations[0]:
         msg += f"\n\n🎯 Первое слово: {lines[0]}"
     
     await update.message.reply_text(msg)
@@ -441,9 +388,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_next_word(update, user_id)
 
 async def send_next_word(update: Update, user_id: int):
-    """
-    Отправляет следующее слово пользователю.
-    """
+    """Отправляет следующее слово (в зависимости от режима)."""
     data = user_data[user_id]
     
     if data['review_mode']:
@@ -453,11 +398,9 @@ async def send_next_word(update: Update, user_id: int):
                 "Отправьте новый файл, чтобы продолжить."
             )
             return
-        
         word_idx = data['review_indices'][data['review_index']]
         word = data['words'][word_idx]
         await update.message.reply_text(f"🔄 Повторение: {word}")
-        
     else:
         if data['current_index'] >= len(data['words']):
             # Основной список закончен
@@ -481,9 +424,7 @@ async def send_next_word(update: Update, user_id: int):
         await update.message.reply_text(f"{progress} Переведи: {word}")
 
 def start_review(user_id: int):
-    """
-    Запускает режим повторения.
-    """
+    """Запускает режим повторения ошибочных слов."""
     data = user_data[user_id]
     wrong_indices = sorted(list(data['wrong_words']))
     data['review_mode'] = True
@@ -491,9 +432,7 @@ def start_review(user_id: int):
     data['review_index'] = 0
 
 async def process_answer(update: Update, user_id: int, user_answer: str):
-    """
-    Обработка ответа пользователя.
-    """
+    """Проверяет ответ и переходит к следующему слову."""
     data = user_data[user_id]
     
     if not data['words']:
@@ -516,8 +455,8 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
     
     if not correct_answer:
         await update.message.reply_text(
-            f"⚠️ Для слова '{current_word}' нет перевода.\n"
-            f"Правильный ответ: [перевод не получен]"
+            f"⚠️ Для слова '{current_word}' нет перевода (возможно, ошибка API).\n"
+            f"Пропускаем..."
         )
         # Пропускаем это слово
         if data['review_mode']:
@@ -537,7 +476,7 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
         if not data['review_mode']:
             data['wrong_words'].add(word_idx)
     
-    # Переходим к следующему слову
+    # Переход к следующему
     if data['review_mode']:
         data['review_index'] += 1
     else:
@@ -546,16 +485,12 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
     await send_next_word(update, user_id)
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработка текстовых сообщений.
-    """
+    """Обрабатывает текстовые ответы."""
     user_id = update.effective_user.id
     await process_answer(update, user_id, update.message.text)
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработка голосовых сообщений.
-    """
+    """Обрабатывает голосовые сообщения."""
     user_id = update.effective_user.id
     
     if not user_data[user_id]['words']:
@@ -581,7 +516,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-            # Определяем язык для распознавания
+            # Определяем язык распознавания (целевой язык ответа)
             lang = 'ru-RU' if user_data[user_id]['target_lang'] == 'russian' else 'en-US'
             text = recognizer.recognize_google(audio_data, language=lang)
         
@@ -594,15 +529,13 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Ошибка распознавания: {e}")
         await update.message.reply_text("⚠️ Ошибка при обработке голоса.")
     finally:
-        # Чистим временные файлы
+        # Удаляем временные файлы
         for path in [tmp_path, wav_path]:
             if os.path.exists(path):
                 os.unlink(path)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Команда /stats - показывает статистику.
-    """
+    """Команда /stats – показывает статистику пользователя."""
     user_id = update.effective_user.id
     data = user_data[user_id]
     
@@ -622,24 +555,21 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚠️ Не переведено: {failed}\n"
         f"📈 Прогресс: {learned}/{total} ({learned/total*100:.1f}%)"
     )
-    
     await update.message.reply_text(stats)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Глобальный обработчик ошибок.
-    """
+    """Глобальный обработчик ошибок."""
     logger.error(f"Ошибка: {context.error}")
-    
     if update and update.effective_message:
         await update.effective_message.reply_text(
             "😵 Произошла внутренняя ошибка. Попробуйте позже."
         )
 
+# ----------------------------------------------------------------------
+# Запуск бота
+# ----------------------------------------------------------------------
+
 def main():
-    """
-    Запуск бота.
-    """
     if not BOT_TOKEN or not MISTRAL_API_KEY:
         logger.error("Не заданы переменные окружения BOT_TOKEN и MISTRAL_API_KEY")
         return
@@ -650,8 +580,10 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
     
-    # Обработчики сообщений
+    # Обработчик выбора режима (callback от инлайн-кнопок)
     application.add_handler(CallbackQueryHandler(mode_callback, pattern="^mode_"))
+    
+    # Обработчики сообщений
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
