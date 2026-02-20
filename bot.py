@@ -47,47 +47,53 @@ user_data = defaultdict(lambda: {
 translation_cache = {}
 
 # ----------------------------------------------------------------------
-# Функции очистки и обработки текста
+# Функции очистки и обработки текста (исправленные)
 # ----------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
+    """
+    Удаляет мусор из извлечённого текста (номера страниц, лишние символы).
+    Восклицательные и вопросительные знаки заменяются на пробелы (чтобы не склеивали слова).
+    """
     if not text:
         return ""
+    # Удаляем номера страниц (часто встречаются в PDF)
     text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
-    text = re.sub(r'[^\w\s\-.,!?;:|•/—]', ' ', text)
+    # Заменяем нежелательные символы на пробелы.
+    # Оставляем: буквы, цифры, пробелы, дефис, точку, запятую, ; : | • / — (тире)
+    # Восклицательные и вопросительные знаки удаляем (заменяем на пробел)
+    text = re.sub(r'[^\w\s\-.,;:|•/—]', ' ', text)
+    # Убираем множественные пробелы
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def clean_translation(text: str) -> str:
+    """
+    Очищает перевод от лишних знаков препинания в конце.
+    """
     text = re.sub(r'[!?.]+$', '', text.strip())
     text = ' '.join(text.split())
     return text
 
 def split_into_words(text: str) -> List[str]:
+    """
+    Разбивает текст на отдельные слова, используя пробелы и знаки-разделители.
+    Дефис оставляется как часть слова (для составных слов).
+    """
     text = clean_text(text)
     if not text:
         return []
     
-    delimiters = ['\n', ';', ',', '•', '|', '/', '—', '-']
-    for delim in delimiters:
-        if delim in text:
-            parts = [part.strip() for part in text.split(delim) if part.strip()]
-            if len(parts) > 1:
-                return parts
-    
-    if ' ' in text:
-        parts = [part.strip() for part in text.split() if part.strip()]
-        if len(parts) > 1:
-            return parts
-    
-    if len(text) > 50:
-        parts = re.findall(r'[A-Z][a-z]*|[a-z]+', text)
-        if len(parts) > 1:
-            return parts
-    
-    return [text]
+    # Разбиваем по пробельным символам и разделителям (запятая, точка с запятой, |, /, —)
+    parts = re.split(r'[\s,;|/—]+', text)
+    # Фильтруем пустые строки
+    words = [p.strip() for p in parts if p.strip()]
+    return words
 
 def extract_words_from_pdf(file_path: str) -> List[str]:
+    """
+    Извлекает слова из PDF с добавлением пробелов между страницами.
+    """
     try:
         with open(file_path, 'rb') as f:
             reader = PyPDF2.PdfReader(f)
@@ -95,7 +101,7 @@ def extract_words_from_pdf(file_path: str) -> List[str]:
             for page in reader.pages:
                 text = page.extract_text()
                 if text:
-                    full_text += text + " "
+                    full_text += text + " "  # пробел между страницами
             if not full_text.strip():
                 return []
             return split_into_words(full_text)
@@ -104,11 +110,17 @@ def extract_words_from_pdf(file_path: str) -> List[str]:
         raise
 
 def extract_words_from_txt(file_path: str) -> List[str]:
+    """
+    Извлекает слова из текстового файла.
+    """
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
     return split_into_words(content)
 
 def extract_words_from_image(file_path: str) -> List[str]:
+    """
+    Извлекает текст из изображения с помощью Tesseract OCR.
+    """
     try:
         image = Image.open(file_path)
         text = pytesseract.image_to_string(image, lang='rus+eng')
@@ -118,6 +130,9 @@ def extract_words_from_image(file_path: str) -> List[str]:
         raise
 
 def detect_language(word: str) -> str:
+    """
+    Определяет язык слова по соотношению кириллицы и латиницы.
+    """
     if not word:
         return 'unknown'
     cyrillic = len(re.findall('[а-яА-Я]', word))
@@ -132,11 +147,18 @@ def detect_language(word: str) -> str:
     return 'unknown'
 
 def normalize_answer(text: str) -> str:
+    """
+    Приводит ответ к стандартному виду для сравнения.
+    """
     text = re.sub(r'[^\w\s]', '', text.lower())
     text = ' '.join(text.split())
     return text
 
 def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> bool:
+    """
+    Проверяет, являются ли ответ и правильный перевод синонимами (через Mistral).
+    При ошибке API использует расстояние Левенштейна как fallback.
+    """
     if normalize_answer(answer) == normalize_answer(correct):
         return True
     
@@ -171,12 +193,16 @@ def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> b
         
     except Exception as e:
         logger.error(f"Ошибка проверки синонимов: {e}")
+        # Fallback: сравнение по Левенштейну
         similarity = difflib.SequenceMatcher(None,
                                            normalize_answer(answer),
                                            normalize_answer(correct)).ratio()
         return similarity > threshold
 
 def translate_word(word: str, source_lang: str, target_lang: str) -> Optional[str]:
+    """
+    Получает перевод через Mistral API. Результат очищается и кэшируется.
+    """
     cache_key = f"{source_lang}_{target_lang}_{word}"
     if cache_key in translation_cache:
         return translation_cache[cache_key]
