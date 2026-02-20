@@ -1,0 +1,5 @@
+python-telegram-bot==20.7
+requests==2.31.0
+PyPDF2==3.0.1
+SpeechRecognition==3.10.0
+pydub==0.25.1
