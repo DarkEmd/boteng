@@ -4,7 +4,7 @@ import re
 import tempfile
 import difflib
 from collections import defaultdict
-from typing import List, Tuple, Optional
+from typing import List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
@@ -14,6 +14,8 @@ import requests
 import PyPDF2
 import speech_recognition as sr
 from pydub import AudioSegment
+from PIL import Image
+import pytesseract
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,12 +27,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MISTRAL_API_KEY = os.environ.get('MISTRAL_API_KEY')
-MISTRAL_MODEL = 'mistral-small'  # можно заменить на 'mistral-medium' или 'mistral-large'
-
-# Режимы перевода
-class TranslationMode:
-    EN_RU = "en_ru"  # английский → русский
-    RU_EN = "ru_en"  # русский → английский
+MISTRAL_MODEL = 'mistral-small'
 
 # Хранилище данных пользователей
 user_data = defaultdict(lambda: {
@@ -41,9 +38,8 @@ user_data = defaultdict(lambda: {
     'review_mode': False,
     'review_indices': [],
     'review_index': 0,
-    'mode': None,
-    'source_lang': None,
-    'target_lang': None,
+    'target_lang': None,        # целевой язык, выбранный пользователем
+    'source_lang': None,         # исходный язык, определённый из файла
     'failed_words': []
 })
 
@@ -55,47 +51,36 @@ translation_cache = {}
 # ----------------------------------------------------------------------
 
 def clean_text(text: str) -> str:
-    """
-    Удаляет мусор из извлечённого текста (номера страниц, лишние символы).
-    """
     if not text:
         return ""
-    # Удаляем номера страниц (часто встречаются в PDF)
     text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
-    # Удаляем странные символы, оставляя буквы, цифры, пробелы и полезные знаки
     text = re.sub(r'[^\w\s\-.,!?;:|•/—]', ' ', text)
-    # Убираем множественные пробелы
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def clean_translation(text: str) -> str:
-    """
-    Очищает перевод от лишних знаков препинания в конце (например, "Совет !!!!!!!!" -> "Совет").
-    """
     text = re.sub(r'[!?.]+$', '', text.strip())
     text = ' '.join(text.split())
     return text
 
 def split_into_words(text: str) -> List[str]:
-    """
-    Интеллектуальное разбиение текста на отдельные слова/фразы.
-    Поддерживает разделители: новая строка, точка с запятой, запятая, •, |, /, —, -
-    """
     text = clean_text(text)
     if not text:
         return []
     
-    # Приоритетные разделители
     delimiters = ['\n', ';', ',', '•', '|', '/', '—', '-']
-    
     for delim in delimiters:
         if delim in text:
             parts = [part.strip() for part in text.split(delim) if part.strip()]
             if len(parts) > 1:
                 return parts
     
-    # Если нет явных разделителей, но строка длинная и без пробелов – пробуем разбить по заглавным буквам
-    if len(text) > 50 and ' ' not in text:
+    if ' ' in text:
+        parts = [part.strip() for part in text.split() if part.strip()]
+        if len(parts) > 1:
+            return parts
+    
+    if len(text) > 50:
         parts = re.findall(r'[A-Z][a-z]*|[a-z]+', text)
         if len(parts) > 1:
             return parts
@@ -103,9 +88,6 @@ def split_into_words(text: str) -> List[str]:
     return [text]
 
 def extract_words_from_pdf(file_path: str) -> List[str]:
-    """
-    Извлекает слова из PDF, очищает и разбивает.
-    """
     try:
         with open(file_path, 'rb') as f:
             reader = PyPDF2.PdfReader(f)
@@ -113,28 +95,29 @@ def extract_words_from_pdf(file_path: str) -> List[str]:
             for page in reader.pages:
                 text = page.extract_text()
                 if text:
-                    full_text += text + "\n"
-            
+                    full_text += text + " "
             if not full_text.strip():
-                return []  # вероятно, сканированный PDF без текстового слоя
-            
+                return []
             return split_into_words(full_text)
     except Exception as e:
         logger.error(f"Ошибка чтения PDF: {e}")
         raise
 
 def extract_words_from_txt(file_path: str) -> List[str]:
-    """
-    Извлекает слова из текстового файла.
-    """
     with open(file_path, 'r', encoding='utf-8') as f:
         content = f.read()
     return split_into_words(content)
 
+def extract_words_from_image(file_path: str) -> List[str]:
+    try:
+        image = Image.open(file_path)
+        text = pytesseract.image_to_string(image, lang='rus+eng')
+        return split_into_words(text)
+    except Exception as e:
+        logger.error(f"Ошибка OCR: {e}")
+        raise
+
 def detect_language(word: str) -> str:
-    """
-    Определяет язык слова по соотношению кириллицы и латиницы.
-    """
     if not word:
         return 'unknown'
     cyrillic = len(re.findall('[а-яА-Я]', word))
@@ -144,25 +127,16 @@ def detect_language(word: str) -> str:
     elif latin > cyrillic:
         return 'english'
     else:
-        # Если поровну или оба нули, смотрим на первый символ
         if word and word[0].isalpha():
             return 'russian' if re.match('[а-яА-Я]', word[0]) else 'english'
     return 'unknown'
 
 def normalize_answer(text: str) -> str:
-    """
-    Приводит ответ к стандартному виду для сравнения.
-    """
     text = re.sub(r'[^\w\s]', '', text.lower())
     text = ' '.join(text.split())
     return text
 
 def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> bool:
-    """
-    Проверяет, являются ли ответ и правильный перевод синонимами (через Mistral).
-    При ошибке API использует расстояние Левенштейна как fallback.
-    """
-    # Быстрая проверка
     if normalize_answer(answer) == normalize_answer(correct):
         return True
     
@@ -197,16 +171,12 @@ def are_similar_meaning(answer: str, correct: str, threshold: float = 0.85) -> b
         
     except Exception as e:
         logger.error(f"Ошибка проверки синонимов: {e}")
-        # Fallback: сравнение по Левенштейну
         similarity = difflib.SequenceMatcher(None,
                                            normalize_answer(answer),
                                            normalize_answer(correct)).ratio()
         return similarity > threshold
 
 def translate_word(word: str, source_lang: str, target_lang: str) -> Optional[str]:
-    """
-    Получает перевод через Mistral API. Результат очищается и кэшируется.
-    """
     cache_key = f"{source_lang}_{target_lang}_{word}"
     if cache_key in translation_cache:
         return translation_cache[cache_key]
@@ -231,7 +201,7 @@ def translate_word(word: str, source_lang: str, target_lang: str) -> Optional[st
         response.raise_for_status()
         result = response.json()
         translation = result['choices'][0]['message']['content'].strip()
-        translation = clean_translation(translation)  # Очищаем от лишних символов
+        translation = clean_translation(translation)
         translation_cache[cache_key] = translation
         return translation
     except Exception as e:
@@ -243,46 +213,47 @@ def translate_word(word: str, source_lang: str, target_lang: str) -> Optional[st
 # ----------------------------------------------------------------------
 
 async def show_mode_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает инлайн-клавиатуру для выбора режима."""
     keyboard = [
-        [InlineKeyboardButton("🇬🇧 Английский → Русский 🇷🇺", callback_data="mode_en_ru")],
-        [InlineKeyboardButton("🇷🇺 Русский → Английский 🇬🇧", callback_data="mode_ru_en")]
+        [InlineKeyboardButton("🇬🇧 Английский → Русский 🇷🇺", callback_data="target_ru")],
+        [InlineKeyboardButton("🇷🇺 Русский → Английский 🇬🇧", callback_data="target_en")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите режим перевода:", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "Выберите, **на какой язык** переводить слова.\n"
+        "Язык исходных слов определится автоматически.",
+        reply_markup=reply_markup
+    )
 
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатие на кнопку выбора режима."""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
-    mode = query.data
+    target = query.data  # "target_ru" или "target_en"
     
-    if mode == "mode_en_ru":
-        user_data[user_id]['mode'] = TranslationMode.EN_RU
-        user_data[user_id]['source_lang'] = 'english'
+    if target == "target_ru":
         user_data[user_id]['target_lang'] = 'russian'
-        await query.edit_message_text("Выбран режим: Английский → Русский")
-    elif mode == "mode_ru_en":
-        user_data[user_id]['mode'] = TranslationMode.RU_EN
-        user_data[user_id]['source_lang'] = 'russian'
+        await query.edit_message_text("✅ Выбран режим: переводим **на русский** язык.")
+    elif target == "target_en":
         user_data[user_id]['target_lang'] = 'english'
-        await query.edit_message_text("Выбран режим: Русский → Английский")
+        await query.edit_message_text("✅ Выбран режим: переводим **на английский** язык.")
     
-    await query.message.reply_text("Теперь отправьте файл со словами.")
+    await query.message.reply_text(
+        "Теперь отправьте файл (.txt/.pdf) или фотографию со словами.\n"
+        "Я сам определю их язык и переведу на выбранный вами язык."
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start."""
     welcome_text = (
         "👋 Привет! Я бот для изучения слов.\n\n"
         "📌 **Как пользоваться:**\n"
-        "1. Выберите режим перевода\n"
-        "2. Отправьте файл .txt или .pdf со словами\n"
+        "1. Выберите, **на какой язык** переводить\n"
+        "2. Отправьте файл .txt, .pdf или фотографию со словами\n"
         "3. Отвечайте текстом или голосом\n"
         "4. Я запомню ошибки и предложу повторить\n\n"
         "✅ **Возможности:**\n"
-        "• Распознаю синонимы\n"
+        "• Распознаю текст на фото (OCR)\n"
+        "• Понимаю синонимы\n"
         "• Игнорирую лишние символы\n"
         "• Разбиваю строки с разделителями (•, |, / и др.)\n"
         "• Поддерживаю голосовой ввод"
@@ -291,12 +262,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_mode_selection(update, context)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает загруженный файл (TXT или PDF)."""
+    """Обрабатывает загруженные файлы (TXT, PDF)."""
     user_id = update.effective_user.id
     document = update.message.document
     
-    # Проверяем, выбран ли режим
-    if user_data[user_id]['mode'] is None:
+    if user_data[user_id]['target_lang'] is None:
         await update.message.reply_text("Сначала выберите режим перевода командой /start")
         return
     
@@ -305,13 +275,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пожалуйста, отправьте файл с расширением .txt или .pdf")
         return
     
-    # Скачиваем файл
     file = await context.bot.get_file(document.file_id)
     with tempfile.NamedTemporaryFile(mode='wb', delete=False) as tmp:
         await file.download_to_drive(tmp.name)
         tmp_path = tmp.name
     
-    # Извлекаем слова
     try:
         if file_name.endswith('.txt'):
             lines = extract_words_from_txt(tmp_path)
@@ -321,7 +289,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not lines:
             await update.message.reply_text(
                 "Не удалось извлечь слова из файла. Возможно, это сканированный PDF без текстового слоя.\n"
-                "Попробуйте другой файл или текстовый формат."
+                "Попробуйте другой файл или используйте фотографию."
             )
             return
     except Exception as e:
@@ -331,18 +299,65 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         os.unlink(tmp_path)
     
-    # Проверка соответствия языка выбранному режиму
-    first_word_lang = detect_language(lines[0])
-    expected_source = user_data[user_id]['source_lang']
-    if first_word_lang != expected_source and first_word_lang != 'unknown':
-        await update.message.reply_text(
-            f"⚠️ Внимание! Язык первого слова ({first_word_lang}) "
-            f"не соответствует выбранному режиму ({expected_source}).\n"
-            f"Продолжаем, но возможны неточности."
-        )
+    await process_words(update, user_id, lines)
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает фотографии (OCR)."""
+    user_id = update.effective_user.id
+    photo = update.message.photo[-1]  # берём самое большое фото
     
-    # Получаем переводы
-    await update.message.reply_text(f"📝 Найдено слов: {len(lines)}. Получаю переводы...")
+    if user_data[user_id]['target_lang'] is None:
+        await update.message.reply_text("Сначала выберите режим перевода командой /start")
+        return
+    
+    file = await context.bot.get_file(photo.file_id)
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        tmp_path = tmp.name
+    
+    await update.message.reply_text("🖼️ Распознаю текст на фото...")
+    
+    try:
+        lines = extract_words_from_image(tmp_path)
+        if not lines:
+            await update.message.reply_text(
+                "Не удалось распознать текст на фото. Убедитесь, что фото чёткое и текст читаемый."
+            )
+            return
+    except Exception as e:
+        logger.error(f"Ошибка OCR: {e}")
+        await update.message.reply_text("Ошибка при распознавании текста.")
+        return
+    finally:
+        os.unlink(tmp_path)
+    
+    await process_words(update, user_id, lines)
+
+async def process_words(update: Update, user_id: int, lines: List[str]):
+    """Общая обработка списка слов: определение языка, перевод, сохранение."""
+    # Определяем язык первого слова
+    first_word_lang = detect_language(lines[0])
+    target_lang = user_data[user_id]['target_lang']
+    
+    if first_word_lang == 'unknown':
+        await update.message.reply_text(
+            "❌ Не удалось определить язык слов. Попробуйте другой файл или фото."
+        )
+        return
+    
+    if first_word_lang == target_lang:
+        await update.message.reply_text(
+            f"❌ Язык слов ({first_word_lang}) совпадает с целевым языком ({target_lang}).\n"
+            f"Невозможно перевести. Проверьте выбранный режим или загрузите слова на другом языке."
+        )
+        return
+    
+    source_lang = first_word_lang
+    user_data[user_id]['source_lang'] = source_lang  # сохраняем для информации
+    
+    await update.message.reply_text(
+        f"📝 Найдено слов: {len(lines)}. Язык: {source_lang}. Перевожу на {target_lang}..."
+    )
     
     translations = []
     failed = []
@@ -351,16 +366,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if i > 0 and i % 10 == 0:
             await update.message.reply_text(f"⏳ Прогресс: {i}/{len(lines)} слов...")
         
-        trans = translate_word(word,
-                               user_data[user_id]['source_lang'],
-                               user_data[user_id]['target_lang'])
+        trans = translate_word(word, source_lang, target_lang)
         if trans:
             translations.append(trans)
         else:
             failed.append(word)
-            translations.append("")  # плейсхолдер
+            translations.append("")
     
-    # Сохраняем данные
+    # Сохраняем
     user_data[user_id].update({
         'words': lines,
         'translations': translations,
@@ -372,7 +385,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'failed_words': failed
     })
     
-    # Отчёт
     msg = f"✅ Загружено: {len(lines)} слов\n"
     msg += f"✅ Переведено: {len(translations) - len(failed)}\n"
     if failed:
@@ -388,14 +400,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_next_word(update, user_id)
 
 async def send_next_word(update: Update, user_id: int):
-    """Отправляет следующее слово (в зависимости от режима)."""
     data = user_data[user_id]
     
     if data['review_mode']:
         if data['review_index'] >= len(data['review_indices']):
             await update.message.reply_text(
                 "🎉 Поздравляю! Вы повторили все ошибочные слова!\n"
-                "Отправьте новый файл, чтобы продолжить."
+                "Отправьте новый файл или фото, чтобы продолжить."
             )
             return
         word_idx = data['review_indices'][data['review_index']]
@@ -403,7 +414,6 @@ async def send_next_word(update: Update, user_id: int):
         await update.message.reply_text(f"🔄 Повторение: {word}")
     else:
         if data['current_index'] >= len(data['words']):
-            # Основной список закончен
             if data['wrong_words']:
                 await update.message.reply_text(
                     f"📊 Основной список пройден!\n"
@@ -415,7 +425,7 @@ async def send_next_word(update: Update, user_id: int):
             else:
                 await update.message.reply_text(
                     "🎉 Идеально! Все слова правильные!\n"
-                    "Отправьте новый файл, чтобы продолжить."
+                    "Отправьте новый файл или фото, чтобы продолжить."
                 )
             return
         
@@ -424,7 +434,6 @@ async def send_next_word(update: Update, user_id: int):
         await update.message.reply_text(f"{progress} Переведи: {word}")
 
 def start_review(user_id: int):
-    """Запускает режим повторения ошибочных слов."""
     data = user_data[user_id]
     wrong_indices = sorted(list(data['wrong_words']))
     data['review_mode'] = True
@@ -432,14 +441,12 @@ def start_review(user_id: int):
     data['review_index'] = 0
 
 async def process_answer(update: Update, user_id: int, user_answer: str):
-    """Проверяет ответ и переходит к следующему слову."""
     data = user_data[user_id]
     
     if not data['words']:
-        await update.message.reply_text("Сначала отправьте файл со словами.")
+        await update.message.reply_text("Сначала отправьте файл или фото со словами.")
         return
     
-    # Определяем текущее слово
     if data['review_mode']:
         if data['review_index'] >= len(data['review_indices']):
             await update.message.reply_text("Режим повторения завершён!")
@@ -458,7 +465,6 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
             f"⚠️ Для слова '{current_word}' нет перевода (возможно, ошибка API).\n"
             f"Пропускаем..."
         )
-        # Пропускаем это слово
         if data['review_mode']:
             data['review_index'] += 1
         else:
@@ -466,7 +472,6 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
         await send_next_word(update, user_id)
         return
     
-    # Проверяем ответ
     is_correct = are_similar_meaning(user_answer, correct_answer)
     
     if is_correct:
@@ -476,7 +481,6 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
         if not data['review_mode']:
             data['wrong_words'].add(word_idx)
     
-    # Переход к следующему
     if data['review_mode']:
         data['review_index'] += 1
     else:
@@ -485,16 +489,14 @@ async def process_answer(update: Update, user_id: int, user_answer: str):
     await send_next_word(update, user_id)
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает текстовые ответы."""
     user_id = update.effective_user.id
     await process_answer(update, user_id, update.message.text)
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает голосовые сообщения."""
     user_id = update.effective_user.id
     
     if not user_data[user_id]['words']:
-        await update.message.reply_text("Сначала отправьте файл со словами.")
+        await update.message.reply_text("Сначала отправьте файл или фото со словами.")
         return
     
     voice = update.message.voice
@@ -507,16 +509,14 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("🎤 Распознаю речь...")
     
     try:
-        # Конвертируем ogg в wav
         audio = AudioSegment.from_ogg(tmp_path)
         wav_path = tmp_path + '.wav'
         audio.export(wav_path, format='wav')
         
-        # Распознаём
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-            # Определяем язык распознавания (целевой язык ответа)
+            # Язык распознавания = целевой язык (на который переводим)
             lang = 'ru-RU' if user_data[user_id]['target_lang'] == 'russian' else 'en-US'
             text = recognizer.recognize_google(audio_data, language=lang)
         
@@ -529,18 +529,16 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"Ошибка распознавания: {e}")
         await update.message.reply_text("⚠️ Ошибка при обработке голоса.")
     finally:
-        # Удаляем временные файлы
         for path in [tmp_path, wav_path]:
             if os.path.exists(path):
                 os.unlink(path)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /stats – показывает статистику пользователя."""
     user_id = update.effective_user.id
     data = user_data[user_id]
     
     if not data['words']:
-        await update.message.reply_text("Нет данных. Сначала отправьте файл.")
+        await update.message.reply_text("Нет данных. Сначала отправьте файл или фото.")
         return
     
     total = len(data['words'])
@@ -558,7 +556,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stats)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный обработчик ошибок."""
     logger.error(f"Ошибка: {context.error}")
     if update and update.effective_message:
         await update.effective_message.reply_text(
@@ -576,19 +573,13 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
-    
-    # Обработчик выбора режима (callback от инлайн-кнопок)
-    application.add_handler(CallbackQueryHandler(mode_callback, pattern="^mode_"))
-    
-    # Обработчики сообщений
+    application.add_handler(CallbackQueryHandler(mode_callback, pattern="^target_"))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
-    
-    # Обработчик ошибок
     application.add_error_handler(error_handler)
     
     logger.info("Бот запущен!")
